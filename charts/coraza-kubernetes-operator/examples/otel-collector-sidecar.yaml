@@ -1,0 +1,175 @@
+# LEGACY / CUSTOMISATION REFERENCE
+#
+# The Engine reconciler now auto-creates an OpenTelemetryCollector sidecar
+# per Engine and patches the target Gateway's infrastructure annotations.
+# You do NOT need this file for standard deployments.
+#
+# Retain this example only if you need a manually customised OTC that the
+# operator does not manage (e.g. extra receivers, custom auth, non-standard
+# volume mounts). If you deploy this alongside an operator-managed Engine,
+# ensure the names do not collide.
+#
+# Pipelines:
+# 1) Envoy stats scrape — transitional waf_filter_* counters from Envoy
+#    /stats/prometheus via port 15090 (http-envoy-prom).
+# 2) Text log → metrics — coraza_waf_rule_hits_from_logs_total from Coraza
+#    text warnings emitted by the WASM plugin on stderr. Parsed via regex
+#    from CRI container log files.
+#
+# Volumes: the filelog receiver needs hostPath /var/log/pods (or an
+# equivalent emptyDir / volume mount providing container log files).
+#
+# OpenShift tip: enable bearertokenauth on the prometheus exporter and point
+# PodMonitor at :9090 with bearerTokenSecret.
+---
+apiVersion: opentelemetry.io/v1beta1
+kind: OpenTelemetryCollector
+metadata:
+  name: coraza-gw-sidecar
+  labels:
+    mode: sidecar
+    app.kubernetes.io/part-of: coraza-kubernetes-operator
+spec:
+  mode: sidecar
+  volumes:
+    - name: varlogpods
+      hostPath:
+        path: /var/log/pods
+        type: Directory
+  volumeMounts:
+    - name: varlogpods
+      mountPath: /var/log/pods
+      readOnly: true
+  config:
+    receivers:
+      # Pipeline 1: scrape Envoy stats for legacy waf_filter_* metrics.
+      prometheus/envoy:
+        config:
+          scrape_configs:
+            - job_name: coraza-envoy
+              metrics_path: /stats/prometheus
+              scrape_interval: 15s
+              static_configs:
+                - targets:
+                    - 127.0.0.1:15090
+
+      # Pipeline 2: Coraza text warnings from WASM plugin stderr.
+      # CRI log format: "<timestamp> <stream> <flags> <log-line>"
+      # Coraza warning format: wasm log <ns>.<engine>~...: [client ...] Coraza: ...
+      #   [id "N"] [severity "S"] [tag "attack-T"]
+      file_log/text_logs:
+        include:
+          # Adjust the glob to match your namespace and Gateway name.
+          - /var/log/pods/*_*gateway*_*/istio-proxy/*.log
+        include_file_path_resolved: true
+        start_at: end
+        operators:
+          - type: regex_parser
+            id: cri_parser
+            regex: '^(?P<time>\S+) (?P<stream>\S+) (?P<flags>\S+) (?P<log_line>.*)$'
+            timestamp:
+              parse_from: attributes.time
+              layout: '%Y-%m-%dT%H:%M:%S.%fZ'
+          - type: filter
+            id: stderr_only
+            expr: 'attributes.stream != "stderr"'
+          - type: filter
+            id: coraza_text_only
+            expr: 'not (attributes.log_line contains "Coraza:")'
+          - type: regex_parser
+            id: coraza_parser
+            parse_from: attributes.log_line
+            regex: 'wasm log (?P<wasm_ns>[^.]+)\.(?P<wasm_engine>[^~]+)~[^:]+:.*\[id "(?P<rule_id>\d+)"\].*\[severity "(?P<severity>[^"]+)"\]'
+          - type: regex_parser
+            id: category_parser
+            parse_from: attributes.log_line
+            regex: '\[tag "(?P<attack_tag>attack-[^"]+)"\]'
+            if: 'attributes.log_line contains "attack-"'
+          - type: move
+            from: attributes.wasm_ns
+            to: resource["namespace"]
+          - type: move
+            from: attributes.wasm_engine
+            to: resource["engine"]
+            if: 'attributes.wasm_engine != nil'
+          - type: add
+            field: attributes.driver_type
+            value: wasm
+
+    processors:
+      filter/waf:
+        metrics:
+          include:
+            match_type: regexp
+            metric_names:
+              - "^(coraza_waf_|waf_filter_).*"
+
+      transform/waf_text_logs:
+        error_mode: ignore
+        log_statements:
+          - context: log
+            statements:
+              - set(attributes["category"], "sqli") where attributes["attack_tag"] == "attack-sqli"
+              - set(attributes["category"], "xss") where attributes["attack_tag"] == "attack-xss"
+              - set(attributes["category"], "rce") where attributes["attack_tag"] == "attack-rce"
+              - set(attributes["category"], "lfi") where attributes["attack_tag"] == "attack-lfi"
+              - set(attributes["category"], "rfi") where attributes["attack_tag"] == "attack-rfi"
+              - set(attributes["category"], "other") where attributes["category"] == nil
+              - set(attributes["severity"], ConvertCase(attributes["severity"], "upper")) where attributes["severity"] != nil
+
+    connectors:
+      count/waf_text:
+        logs:
+          coraza_waf_rule_hits_from_logs_total:
+            description: "WAF rule match events parsed from Coraza text logs"
+            attributes:
+              - key: engine
+                default_value: unknown
+              - key: namespace
+                default_value: unknown
+              - key: driver_type
+                default_value: wasm
+              - key: rule_id
+                default_value: "0"
+              - key: severity
+                default_value: UNKNOWN
+              - key: category
+                default_value: other
+
+    exporters:
+      prometheus:
+        endpoint: 0.0.0.0:9090
+      debug:
+        verbosity: basic
+
+    service:
+      pipelines:
+        # Pipeline 1: Envoy stats → filter → Prometheus
+        metrics/envoy:
+          receivers: [prometheus/envoy]
+          processors: [filter/waf]
+          exporters: [prometheus]
+        # Pipeline 2: text logs → transform → count connector → Prometheus
+        logs/waf_text:
+          receivers: [file_log/text_logs]
+          processors: [transform/waf_text_logs]
+          exporters: [count/waf_text, debug]
+        metrics/waf_from_text:
+          receivers: [count/waf_text]
+          exporters: [prometheus]
+---
+# Optional PodMonitor scraping the OTC sidecar export (not Envoy directly).
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: coraza-gateway-otel
+  labels:
+    app.kubernetes.io/part-of: coraza-kubernetes-operator
+spec:
+  selector:
+    matchLabels:
+      gateway.networking.k8s.io/gateway-name: my-gateway
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      scheme: http

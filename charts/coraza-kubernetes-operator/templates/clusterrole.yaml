@@ -86,6 +86,7 @@ rules:
   verbs:
   - get
   - list
+  - patch
   - watch
 - apiGroups:
   - networking.istio.io
@@ -97,6 +98,18 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - opentelemetry.io
+  resources:
+  - opentelemetrycollectors
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
 - apiGroups:
   - waf.k8s.coraza.io
   resources:

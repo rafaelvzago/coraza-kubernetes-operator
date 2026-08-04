@@ -109,6 +109,8 @@ func (r *EngineReconciler) provisionWasmDriver(ctx context.Context, log logr.Log
 		return ctrl.Result{}, err
 	}
 
+	r.reconcileOTCBestEffort(ctx, log, req, engine)
+
 	logDebug(log, req, "Engine", "Updating status after successful provisioning")
 	if patchErr := patchReady(ctx, r.Status(), r.Recorder, log, req, "Engine", engine, &engine.Status.Conditions, engine.Generation, "Configured", "WasmPlugin successfully created/updated"); patchErr != nil {
 		return ctrl.Result{}, patchErr
